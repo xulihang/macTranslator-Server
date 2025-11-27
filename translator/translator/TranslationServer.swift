@@ -116,7 +116,7 @@ class TranslationServer: ObservableObject {
                 if let requestString = String(data: data, encoding: .utf8) {
                     self.processRequest(requestString, connection: connection)
                 } else {
-                    self.sendErrorResponse(connection, error: "无法解析请求数据")
+                    self.sendErrorResponse(connection, error: "无法解析请求数据", statusCode: 400)
                     self.receiveHTTPRequest(connection)
                 }
             } else if let error = error {
@@ -136,30 +136,63 @@ class TranslationServer: ObservableObject {
         
         let lines = requestString.components(separatedBy: "\r\n")
         guard let firstLine = lines.first else {
-            sendErrorResponse(connection, error: "无效的请求")
+            sendErrorResponse(connection, error: "无效的请求", statusCode: 400)
             receiveHTTPRequest(connection)
             return
         }
         
         let components = firstLine.components(separatedBy: " ")
-        guard components.count >= 3, components[0] == "POST", components[1] == "/translate" else {
-            sendErrorResponse(connection, error: "只支持 POST /translate 端点")
+        guard components.count >= 3 else {
+            sendErrorResponse(connection, error: "无效的请求格式", statusCode: 400)
             receiveHTTPRequest(connection)
             return
         }
         
-        if let bodyRange = requestString.range(of: "\r\n\r\n") {
-            let bodyString = String(requestString[bodyRange.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
-            processTranslationRequest(bodyString, connection: connection)
+        let method = components[0]
+        let path = components[1]
+        
+        // 处理 HEAD 请求
+        if method == "HEAD" {
+            handleHeadRequest(connection, path: path)
+            return
+        }
+        
+        // 处理 POST 翻译请求
+        if method == "POST" && path == "/translate" {
+            if let bodyRange = requestString.range(of: "\r\n\r\n") {
+                let bodyString = String(requestString[bodyRange.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                processTranslationRequest(bodyString, connection: connection)
+            } else {
+                sendErrorResponse(connection, error: "没有请求体", statusCode: 400)
+                receiveHTTPRequest(connection)
+            }
         } else {
-            sendErrorResponse(connection, error: "没有请求体")
+            sendErrorResponse(connection, error: "不支持的端点或方法", statusCode: 404)
             receiveHTTPRequest(connection)
         }
     }
     
+    private func handleHeadRequest(_ connection: NWConnection, path: String) {
+        // 对于 HEAD 请求，只返回头部信息，不返回实际内容
+        
+        var response = """
+            HTTP/1.1 404 Not Found
+            Content-Type: application/json
+            Access-Control-Allow-Origin: *
+            Access-Control-Allow-Methods: POST, GET, OPTIONS, HEAD
+            Access-Control-Allow-Headers: *
+            Content-Length: 0
+            
+            """
+
+        
+        sendResponse(connection, response: response)
+        receiveHTTPRequest(connection)
+    }
+    
     private func processTranslationRequest(_ bodyString: String, connection: NWConnection) {
         guard let bodyData = bodyString.data(using: .utf8) else {
-            sendErrorResponse(connection, error: "无效的请求体编码")
+            sendErrorResponse(connection, error: "无效的请求体编码", statusCode: 400)
             receiveHTTPRequest(connection)
             return
         }
@@ -169,7 +202,7 @@ class TranslationServer: ObservableObject {
             guard let text = json?["text"] as? String,
                   let sourceLang = json?["source_language"] as? String,
                   let targetLang = json?["target_language"] as? String else {
-                sendErrorResponse(connection, error: "无效的 JSON 数据")
+                sendErrorResponse(connection, error: "无效的 JSON 数据", statusCode: 400)
                 receiveHTTPRequest(connection)
                 return
             }
@@ -193,23 +226,35 @@ class TranslationServer: ObservableObject {
             }
             
         } catch {
-            sendErrorResponse(connection, error: "JSON 解析错误: \(error.localizedDescription)")
+            sendErrorResponse(connection, error: "JSON 解析错误: \(error.localizedDescription)", statusCode: 400)
             receiveHTTPRequest(connection)
         }
+    }
+    
+    func normalizeNewlines(in text: String) -> String {
+        // 先统一换行符为 \n
+        var normalized = text.replacingOccurrences(of: "\r\n", with: "\n")
+        normalized = normalized.replacingOccurrences(of: "\r", with: "\n")
+        
+        // 然后替换多个连续换行为一个
+        return normalized.replacingOccurrences(of: "\n{2,}",
+                                             with: "\n",
+                                             options: .regularExpression)
     }
     
     func handleTranslationResult(_ result: Result<String, Error>) {
         guard let connection = currentConnection else { return }
         
         switch result {
-        case .success(let translatedText):
+        case .success(var translatedText):
+            translatedText = normalizeNewlines(in: translatedText)
             DispatchQueue.main.async {
                 self.lastResponse = translatedText
             }
             sendSuccessResponse(connection, translatedText: translatedText)
             
         case .failure(let error):
-            sendErrorResponse(connection, error: "翻译错误: \(error.localizedDescription)")
+            sendErrorResponse(connection, error: "翻译错误: \(error.localizedDescription)", statusCode: 500)
         }
         
         // 修复：在翻译完成后立即清理状态，准备下一次请求
@@ -226,7 +271,7 @@ class TranslationServer: ObservableObject {
         let jsonResponse = ["translated_text": translatedText]
         guard let jsonData = try? JSONSerialization.data(withJSONObject: jsonResponse),
               let jsonString = String(data: jsonData, encoding: .utf8) else {
-            sendErrorResponse(connection, error: "无法生成响应")
+            sendErrorResponse(connection, error: "无法生成响应", statusCode: 500)
             return
         }
         
@@ -234,7 +279,7 @@ class TranslationServer: ObservableObject {
         HTTP/1.1 200 OK
         Content-Type: application/json
         Access-Control-Allow-Origin: *
-        Access-Control-Allow-Methods: POST, GET, OPTIONS
+        Access-Control-Allow-Methods: POST, GET, OPTIONS, HEAD
         Access-Control-Allow-Headers: *
         Content-Length: \(jsonData.count)
         
@@ -244,7 +289,7 @@ class TranslationServer: ObservableObject {
         sendResponse(connection, response: response)
     }
     
-    private func sendErrorResponse(_ connection: NWConnection, error: String) {
+    private func sendErrorResponse(_ connection: NWConnection, error: String, statusCode: Int = 400) {
         let jsonResponse = ["error": error]
         guard let jsonData = try? JSONSerialization.data(withJSONObject: jsonResponse),
               let jsonString = String(data: jsonData, encoding: .utf8) else {
@@ -252,10 +297,10 @@ class TranslationServer: ObservableObject {
         }
         
         let response = """
-        HTTP/1.1 400 Bad Request
+        HTTP/1.1 \(statusCode) \(getStatusText(for: statusCode))
         Content-Type: application/json
         Access-Control-Allow-Origin: *
-        Access-Control-Allow-Methods: POST, GET, OPTIONS
+        Access-Control-Allow-Methods: POST, GET, OPTIONS, HEAD
         Access-Control-Allow-Headers: *
         Content-Length: \(jsonData.count)
         
@@ -263,6 +308,17 @@ class TranslationServer: ObservableObject {
         """
         
         sendResponse(connection, response: response)
+    }
+    
+    private func getStatusText(for statusCode: Int) -> String {
+        switch statusCode {
+        case 200: return "OK"
+        case 400: return "Bad Request"
+        case 404: return "Not Found"
+        case 405: return "Method Not Allowed"
+        case 500: return "Internal Server Error"
+        default: return "Unknown"
+        }
     }
     
     private func sendResponse(_ connection: NWConnection, response: String) {
